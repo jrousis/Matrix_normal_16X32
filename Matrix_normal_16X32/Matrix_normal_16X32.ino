@@ -73,7 +73,7 @@ Ds1302 rtc(RTC_PIN_ENA, RTC_PIN_CLK, RTC_PIN_DAT);
 
 const char Company[] = { "Rousis LTD" };
 const char Device[] = { "Matrix 32" };
-const char Version[] = { "V.3.0    " };
+const char Version[] = { "V.3.1    " };
 const char Init_start[] = { "ROUSIS SYSTEMS" };
 static char receive_packet[512] = { 0 };   // enlarged: 4 lines of text
 
@@ -144,10 +144,11 @@ void fill_rtc_line(uint8_t l) {
     char buf[12];
     if (line_rtc[l] == 3) {                      // temperature (DC)
         if (temp_ready) {
-            snprintf(buf, sizeof(buf), "%.1f C", temperatureC);
+			// for degree symbol, use 0xB0 (°) in the font
+            snprintf(buf, sizeof(buf), "%.1f%cC", temperatureC, 0xB0);
         }
         else {
-            snprintf(buf, sizeof(buf), "--.- C");
+            snprintf(buf, sizeof(buf), "--.-%cC", 0xB0);
         }
     }
     else {
