@@ -33,6 +33,9 @@
 #define TIMEOUT_MESSAGE false
 #define MESSAGE_TIMEOUT_S (5UL * 60UL * 1000UL) // 5 minutes in milliseconds
 
+#define RX_BYTE_TIMEOUT_MS   150   // μέγιστη παύση μεταξύ bytes (>100ms break)
+#define RX_TOTAL_TIMEOUT_MS  300   // απόλυτο όριο για ολόκληρο το πακέτο
+
 #include <Arduino.h>
 #include <Ds1302.h>
 #include <RousisMatrix16_Static.h>
@@ -58,6 +61,8 @@ Preferences prefs;
 OneWire oneWire(TEMP_PIN);
 DallasTemperature sensors(&oneWire);
 
+uint32_t line_evt_base[MAX_LINES] = { 0 };  // JDN της ημερομηνίας event (@=d/m/y)
+
 float temperatureC = 0.0;
 bool  temp_ready = false;        // valid reading available
 bool  temp_requested = false;    // conversion in progress
@@ -72,7 +77,7 @@ unsigned long temp_req_time = 0;
 Ds1302 rtc(RTC_PIN_ENA, RTC_PIN_CLK, RTC_PIN_DAT);
 
 const char Company[] = { "Rousis LTD" };
-const char Device[] = { "Matrix 32" };
+const char Device[] = { "Matrix 80 X 32" };
 const char Version[] = { "V.3.1    " };
 const char Init_start[] = { "ROUSIS SYSTEMS" };
 static char receive_packet[512] = { 0 };   // enlarged: 4 lines of text
@@ -127,6 +132,15 @@ HardwareSerial rs485(1);
 TaskHandle_t Task0;
 TaskHandle_t Task1;
 
+// d/m/y (πλήρες έτος) -> Julian Day Number. Διαφορά δύο JDN = ημέρες.
+static uint32_t date_to_days(uint16_t y, uint8_t m, uint8_t d) {
+    int a = (14 - m) / 12;
+    long yy = (long)y + 4800 - a;
+    int  mm = m + 12 * a - 3;
+    return (uint32_t)(d + (153L * mm + 2) / 5 + 365L * yy
+        + yy / 4 - yy / 100 + yy / 400 - 32045);
+}
+
 // select the correct font for a line before drawing / measuring
 void select_line_font(uint8_t l) {
     if (line_dbl[l]) {
@@ -142,7 +156,15 @@ void select_line_font(uint8_t l) {
 // fill an RTC/sensor placeholder line with current time/date/temperature text
 void fill_rtc_line(uint8_t l) {
     char buf[12];
-    if (line_rtc[l] == 3) {                      // temperature (DC)
+    if (line_rtc[l] == 4) {                      // event counter (@=d/m/y)
+        Ds1302::DateTime now;
+        rtc.getDateTime(&now);
+        uint32_t today = date_to_days(2000 + now.year, now.month, now.day);
+        long diff = (long)today - (long)line_evt_base[l];
+        if (diff < 0) { diff = 0; }              // ημερομηνία στο μέλλον -> 0
+        snprintf(buf, sizeof(buf), "%ld", diff);
+    }
+    else if (line_rtc[l] == 3) {                      // temperature (DC)
         if (temp_ready) {
 			// for degree symbol, use 0xB0 (°) in the font
             snprintf(buf, sizeof(buf), "%.1f%cC", temperatureC, 0xB0);
@@ -410,6 +432,24 @@ void Task0code(void* pvParameters) {
                     }
                     lines_used = cur + 1;
 
+                    // ---------- event counter: γραμμή της μορφής @=d/m/y ----------
+                    for (uint8_t l = 0; l < lines_used; l++)
+                    {
+                        if (line_cnt[l] >= 6 && line_txt[l][0] == '@' && line_txt[l][1] == '=')
+                        {
+                            int d = 0, m = 0, y = 0;
+                            if (sscanf(&line_txt[l][2], "%d/%d/%d", &d, &m, &y) == 3
+                                && d >= 1 && d <= 31 && m >= 1 && m <= 12)
+                            {
+                                if (y < 100) { y += 2000; }          // 24 -> 2024
+                                line_evt_base[l] = date_to_days((uint16_t)y, (uint8_t)m, (uint8_t)d);
+                                line_rtc[l] = 4;                     // γεμίζει από fill_rtc_line
+                                line_cnt[l] = 0;
+                                line_txt[l][0] = 0;
+                            }
+                        }
+                    }
+
                     // ---------- layout: assign y per line, 4 slots of 8px ----------
                     // small line at slot s: y = s*8  -> 0, 8, 16, 24
                     // double line: y = s*8, occupies 2 slots (16px tall)
@@ -557,91 +597,131 @@ void loop()
         byte get_byte;
         do {
             get_byte = rs485.read();
+            
             if (get_byte == 0xCA)
             {
+                // ---------- 1. 4 bytes μετρητή ----------
                 _cnt_byte = 0; packet_cnt = 0;
-                loop_stop = true;
-                while (millis() - startedWaiting <= 300 && loop_stop) {
-                    if (rs485.available())
-                    {
-                        header_cnt[_cnt_byte++] = rs485.read();
-                        if (_cnt_byte >= 4)
-                        {
-                            unstruction = 1;
-                            _cnt_byte = header_cnt[2] << 8;
-                            _cnt_byte |= header_cnt[3];
-                            packet_cnt = _cnt_byte;
-                            if (packet_cnt > sizeof(receive_packet)) {
-                                packet_cnt = sizeof(receive_packet);
-                            }
-                            delay(10);
-                            get_byte = 0;
-                            loop_stop = false;
-                        }
-                        startedWaiting = millis();
-                    }
-                }
-            }
-
-            if (get_byte == 0x01 && unstruction == 0x01) // receive the main packet
-            {
-                _cnt_byte--;
-                while (millis() - startedWaiting <= 300)
+                unsigned long packetStart = millis();
+                startedWaiting = millis();
+                while ((millis() - startedWaiting) <= RX_BYTE_TIMEOUT_MS
+                    && (millis() - packetStart) <= RX_TOTAL_TIMEOUT_MS
+                    && _cnt_byte < 4)
                 {
                     if (rs485.available())
                     {
-                        if (receiving_count < sizeof(receive_packet)) {
-                            receive_packet[receiving_count++] = rs485.read();
-                        }
-                        else {
-                            rs485.read(); // discard overflow
-                        }
-                        _cnt_byte--;
-                        if (_cnt_byte == 0)
-                        {
-                            packet_cnt--;
-                            for (size_t i = (packet_cnt); i < (sizeof(receive_packet) - 1); i++)
-                            {
-                                receive_packet[i] = 0xff;
-                            }
-                            unstruction = 0xA1;
-
-                            // ---- DEBUG: hex dump of received packet ----
-                            Serial.println("Received_packet:");
-                            uint8_t line_br = 0;
-                            for (size_t i = 0; i < packet_cnt; i++)
-                            {
-                                Serial.print((uint8_t)receive_packet[i], HEX);
-                                line_br++;
-                                if (line_br > 31) { line_br = 0; Serial.println(); }
-                                else { Serial.print(" "); }
-                            }
-                            Serial.println();
-                            Serial.println("_________________________________");
-                            // --------------------------------------------
-
-                            delay(10);
-
-                            // A2 = Set Clock packet: consume here, not a message
-                            if ((uint8_t)receive_packet[3] == 0xA2 && packet_cnt >= 11)
-                            {
-                                set_rtc_bcd((uint8_t*)&receive_packet[4]);
-                                Replay_OK();
-                                packet_cnt = 0; // nothing for the message parser
-                                break;
-                            }
-
-                            Replay_OK();
-                            save_message_packet();        // persist to NVS
-                            if (TIMEOUT_MESSAGE) { message_timeout = millis(); }
-                            myLED.stop_flag = true;
-                            timeout_flag = false;
-                            messages_enable = false;
-                            break;
-                        }
+                        header_cnt[_cnt_byte++] = rs485.read();
                         startedWaiting = millis();
                     }
                 }
+                if (_cnt_byte < 4) { rs485_discard(); break; }
+
+                packet_cnt = ((uint16_t)header_cnt[2] << 8) | header_cnt[3];
+                if (packet_cnt < 6) { packet_cnt = 0; rs485_discard(); break; }
+                if (packet_cnt > sizeof(receive_packet)) { packet_cnt = sizeof(receive_packet); }
+
+                // ---------- 2. λήψη ΟΛΟΥ του main packet, οδηγούμενη από τον μετρητή ----------
+                bool got_start = false;
+                bool complete = false;
+                receiving_count = 0;
+                startedWaiting = millis();
+                while ((millis() - startedWaiting) <= RX_BYTE_TIMEOUT_MS
+                    && (millis() - packetStart) <= RX_TOTAL_TIMEOUT_MS)
+                {
+                    if (!rs485.available()) { continue; }
+                    uint8_t v = rs485.read();
+                    startedWaiting = millis();
+
+                    if (!got_start)
+                    {
+                        if (v == 0x01) { got_start = true; }   // αρχή preamble
+                        continue;
+                    }
+                    if (receiving_count < sizeof(receive_packet))
+                    {
+                        receive_packet[receiving_count++] = v;
+                    }
+                    if (receiving_count >= (packet_cnt - 1))   // το 01 δεν αποθηκεύεται
+                    {
+                        complete = true;
+                        break;
+                    }
+                }
+
+                if (!complete)
+                {
+                    Serial.printf("RX abort: %u/%u bytes (%s)\n",
+                        receiving_count, packet_cnt - 1,
+                        (millis() - packetStart) > RX_TOTAL_TIMEOUT_MS ? "total" : "byte");
+                    rs485_discard();
+                    packet_cnt = 0;
+                    break;
+                }
+
+                packet_cnt--;   // αποθηκευμένο μήκος (χωρίς το 01)
+                for (size_t i = packet_cnt; i < (sizeof(receive_packet) - 1); i++)
+                {
+                    receive_packet[i] = 0xff;
+                }
+
+                // ---- DEBUG: hex dump ----
+                Serial.println("Received_packet:");
+                uint8_t line_br = 0;
+                for (size_t i = 0; i < packet_cnt; i++)
+                {
+                    Serial.print((uint8_t)receive_packet[i], HEX);
+                    line_br++;
+                    if (line_br > 31) { line_br = 0; Serial.println(); }
+                    else { Serial.print(" "); }
+                }
+                Serial.println();
+                Serial.println("_________________________________");
+
+                // ---- έλεγχος διεύθυνσης: [0]=55 [1]=AA [2]=addr [3]=type ----
+                if ((uint8_t)receive_packet[2] != 0 && (uint8_t)receive_packet[2] != Address)
+                {
+                    packet_cnt = 0;
+                    break;
+                }
+
+                delay(10);   // ack ~10 ms μετά τη λήψη
+
+                switch ((uint8_t)receive_packet[3])
+                {
+                case 0xA2:   // Set Clock με header
+                    if (packet_cnt >= 11) { set_rtc_bcd((uint8_t*)&receive_packet[4]); Replay_OK(); }
+                    packet_cnt = 0;
+                    break;
+
+                case 0xA3:   // Request Sign ID με header
+                    delay(90);
+                    Send_Sign_ID();
+                    packet_cnt = 0;
+                    break;
+
+                case 0xAF:   // Test με header
+                    test_enable = true;
+                    display_test_paterns();
+                    delay(500);
+                    Replay_OK();
+                    test_enable = false;
+                    packet_cnt = 0;
+                    break;
+
+                case 0xA1:   // κανονικό μήνυμα
+                    Replay_OK();
+                    save_message_packet();
+                    if (TIMEOUT_MESSAGE) { message_timeout = millis(); }
+                    myLED.stop_flag = true;
+                    timeout_flag = false;
+                    messages_enable = false;
+                    break;
+
+                default:
+                    packet_cnt = 0;
+                    break;
+                }
+                break;
             }
             else if (get_byte == 0x01)
             {
@@ -694,20 +774,8 @@ void loop()
                 }
 
                 if (unstruction == 0xA3) { // instruction receive loop
-                    delay(100);
-                    char Sent_Pckt[] = { 0xAA, 0x55, '4', 'L' };
-                    char Sign_ID[] = { "/Matrix80X32/M3/V7.2/Rousis" };
-                    digitalWrite(RS485_PIN_DIR, RS485_WRITE);
-                    for (size_t i = 0; i < sizeof(Sent_Pckt); i++)
-                    {
-                        rs485.write(Sent_Pckt[i]);
-                    }
-                    for (size_t i = 0; i < sizeof(Sign_ID); i++)
-                    {
-                        rs485.write(Sign_ID[i]);
-                    }
-                    rs485.flush();
-                    digitalWrite(RS485_PIN_DIR, RS485_READ);
+                    delay(10);
+                    Send_Sign_ID();
                     _cnt_byte = 0;
                     unstruction = 0;
                 }
@@ -765,6 +833,20 @@ void Replay_OK(void) {
     }
     rs485.flush();
     digitalWrite(RS485_PIN_DIR, RS485_READ);
+}
+
+void Send_Sign_ID(void) {
+    char Sent_Pckt[] = { 0xAA, 0x55, '4', 'L' };
+    char Sign_ID[] = { "/Matrix80X32/M3/V7.2/Rousis" };
+    digitalWrite(RS485_PIN_DIR, RS485_WRITE);
+    for (size_t i = 0; i < sizeof(Sent_Pckt); i++) { rs485.write(Sent_Pckt[i]); }
+    for (size_t i = 0; i < sizeof(Sign_ID); i++) { rs485.write(Sign_ID[i]); }
+    rs485.flush();
+    digitalWrite(RS485_PIN_DIR, RS485_READ);
+}
+
+void rs485_discard(void) {
+    while (rs485.available()) { rs485.read(); }
 }
 
 void Photo_sample() {
